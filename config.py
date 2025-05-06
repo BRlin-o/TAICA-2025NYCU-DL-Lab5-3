@@ -44,8 +44,8 @@ class Config:
     NUM_WORKERS = 8
     
     # 採樣參數
-    GUIDANCE_SCALE = 3.0  # Classifier-free guidance強度
-    CLASSIFIER_GUIDANCE_SCALE = 0.5  # 分類器引導強度
+    GUIDANCE_SCALE = 5.0  # Classifier-free guidance強度
+    CLASSIFIER_GUIDANCE_SCALE = 1  # 分類器引導強度
     
     # 創建必要的目錄
     @staticmethod

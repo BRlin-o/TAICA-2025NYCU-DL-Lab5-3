@@ -79,6 +79,8 @@ def train(config, resume_checkpoint=None):
         unet_sample_size=config.IMAGE_SIZE // 4,  # 潛在空間大小
         condition_embedding_dim=config.CONDITION_DIM,
         device=device,
+        use_pretrain_vae=False, 
+        # use_pretrain_vae=True,
     )
     
     # 設置優化器
@@ -186,7 +188,7 @@ def train(config, resume_checkpoint=None):
             logger.info(f"Saved best model with loss {best_loss:.6f}")
         
         # 每5個epoch保存一個檢查點
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 1 == 0:
             save_checkpoint(accelerator.unwrap_model(model), optimizer, scheduler, epoch, global_step, avg_loss, config)
             logger.info(f"Saved checkpoint at epoch {epoch+1}")
             
