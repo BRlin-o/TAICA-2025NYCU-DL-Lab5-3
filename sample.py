@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import logging
 
-from models.model import ConditionalLDM
+from models.model import ConditionalDiffusionModel
 from evaluator import evaluation_model
 from data.dataset import get_dataloader
 from config import Config
@@ -35,17 +35,12 @@ def load_model(checkpoint_path, config):
     device = config.DEVICE
     
     # 創建模型
-    model = ConditionalLDM(
-        unet_dim=config.UNET_DIM,
-        condition_dim=config.CONDITION_DIM,
-        time_embedding_dim=config.TIME_EMBEDDING_DIM,
+    model = ConditionalDiffusionModel(
         num_classes=config.NUM_CLASSES,
-        use_attention=config.USE_ATTENTION,
-        image_size=config.IMAGE_SIZE,
-        channels=3,
-        latent_channels=config.LATENT_CHANNELS,
-        variational=True,
-        training=False
+        unet_in_channels=config.LATENT_CHANNELS,
+        unet_sample_size=config.IMAGE_SIZE // 4,  # 潛在空間大小
+        condition_embedding_dim=config.CONDITION_DIM,
+        device=device,
     )
     
     # 加載檢查點
@@ -75,6 +70,9 @@ def generate_test_images(model, config, evaluator=None):
     special_label[0, obj2idx["cyan cube"]] = 1.0
     special_label = special_label.to(config.DEVICE)
     
+    # 設置隨機生成器以確保可重現性
+    generator = torch.Generator(device=config.DEVICE).manual_seed(config.SEED)
+    
     # 生成test圖像
     logger.info("Generating images for test.json...")
     test_images = model.sample(
@@ -83,7 +81,7 @@ def generate_test_images(model, config, evaluator=None):
         guidance_scale=config.GUIDANCE_SCALE,
         classifier_scale=config.CLASSIFIER_GUIDANCE_SCALE,
         num_inference_steps=config.NUM_INFERENCE_STEPS,
-        device=config.DEVICE
+        generator=generator,
     )
     
     # 生成new_test圖像
@@ -94,7 +92,7 @@ def generate_test_images(model, config, evaluator=None):
         guidance_scale=config.GUIDANCE_SCALE,
         classifier_scale=config.CLASSIFIER_GUIDANCE_SCALE,
         num_inference_steps=config.NUM_INFERENCE_STEPS,
-        device=config.DEVICE
+        generator=generator,
     )
     
     # 生成去噪過程可視化
@@ -102,8 +100,8 @@ def generate_test_images(model, config, evaluator=None):
     process_images = model.visualize_denoising(
         special_label,
         num_inference_steps=config.NUM_INFERENCE_STEPS,
-        device=config.DEVICE,
-        num_images=8
+        num_images=8,
+        generator=generator,
     )
     
     # 評估生成的圖像

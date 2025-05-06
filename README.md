@@ -9,8 +9,12 @@
 - **MacOS / Linux:**
 
     ```bash
+    ## env create
     python -m venv .venv
     source ./.venv/bin/activate
+
+    ## pip update
+    pip install --upgrade pip
 
     ## Normal
     pip install -r requirements.txt
@@ -21,8 +25,12 @@
 - **Windows**
 
     ```bash
+    ## env create
     python -m venv .venv
     .\.venv\Scripts\activate.bat
+
+    ## pip update
+    pip install --upgrade pip
 
     ## Normal
     pip install -r requirements.txt

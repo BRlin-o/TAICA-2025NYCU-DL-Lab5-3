@@ -5,6 +5,7 @@ import random
 from PIL import Image
 from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
+from diffusers import AutoencoderKL
 
 def set_seed(seed):
     """
@@ -98,3 +99,28 @@ def format_time(seconds):
     minutes = (seconds % 3600) // 60
     seconds = seconds % 60
     return f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+def download_vae_model(model_id="stabilityai/stable-diffusion-xl-base-1.0", subfolder="vae", save_path="./pretrained_models"):
+    """下載 VAE 模型到本地並返回保存路徑"""
+    
+    full_save_path = os.path.join(save_path, model_id.split("/")[-1] + "-" + subfolder)
+    os.makedirs(full_save_path, exist_ok=True)
+    
+    print(f"Downloading VAE model from {model_id}/{subfolder}...")
+    
+    try:
+        # 下載模型
+        vae = AutoencoderKL.from_pretrained(
+            model_id,
+            subfolder=subfolder,
+            torch_dtype=torch.float32,
+        )
+        
+        # 保存到本地
+        vae.save_pretrained(full_save_path)
+        print(f"Model successfully downloaded and saved to {full_save_path}")
+        
+        return full_save_path
+    except Exception as e:
+        print(f"Error downloading model: {e}")
+        return None

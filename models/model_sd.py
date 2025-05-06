@@ -1,12 +1,38 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler, AutoencoderKL
 
+def download_vae_model(model_id="stabilityai/sd-vae-ft-mse", subfolder="vae", save_path="./pretrained_models"):
+    """下載 VAE 模型到本地並返回保存路徑"""
+    
+    full_save_path = os.path.join(save_path, model_id.split("/")[-1] + "-" + subfolder)
+    os.makedirs(full_save_path, exist_ok=True)
+    
+    print(f"Downloading VAE model from {model_id}/{subfolder}...")
+    
+    try:
+        # 下載模型
+        vae = AutoencoderKL.from_pretrained(
+            model_id,
+            subfolder=subfolder,
+            torch_dtype=torch.float32,
+        )
+        
+        # 保存到本地
+        vae.save_pretrained(full_save_path)
+        print(f"Model successfully downloaded and saved to {full_save_path}")
+        
+        return full_save_path
+    except Exception as e:
+        print(f"Error downloading model: {e}")
+        return None
+
 class ConditionalDiffusionModel(nn.Module):
     """
-    條件式擴散模型，使用 diffusers 庫
+    條件式擴散模型，使用 diffusers 庫和 SD 預訓練 VAE
     """
     def __init__(
         self,
@@ -15,6 +41,9 @@ class ConditionalDiffusionModel(nn.Module):
         unet_sample_size=16,  # 默認潛在空間大小，64/4=16
         condition_embedding_dim=768,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        vae_model_id="stabilityai/sd-vae-ft-mse",
+        vae_subfolder="vae",
+        vae_local_path="./pretrained_models",
     ):
         super().__init__()
         self.device = device
@@ -30,21 +59,75 @@ class ConditionalDiffusionModel(nn.Module):
             nn.LayerNorm(condition_embedding_dim),
         ).to(device)
         
-        # 使用更簡單的 VAE 初始化 - 避免與 SD 模型設備不匹配問題
-        self.vae = AutoencoderKL(
-            in_channels=3,  # RGB圖像
-            out_channels=3,  # RGB輸出
-            down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-            up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-            block_out_channels=(128, 256, 512, 512),
-            layers_per_block=2,
-            act_fn="silu",
-            latent_channels=unet_in_channels,
-            sample_size=unet_sample_size * 4,  # 64x64
-        ).to(device)
+        # VAE加載邏輯：優先嘗試從本地加載
+        print(f"嘗試加載 VAE 模型到設備: {device}")
+        vae_loaded = False
         
-        # VAE配置
-        self.vae_scale_factor = 4  # 下採樣因子
+        # 構建可能的本地模型路徑
+        local_model_path = os.path.join(vae_local_path, vae_model_id.split("/")[-1] + "-" + vae_subfolder)
+        
+        # 1. 首先嘗試從指定的本地路徑加載
+        if os.path.exists(local_model_path):
+            try:
+                print(f"從本地路徑加載 VAE: {local_model_path}")
+                self.vae = AutoencoderKL.from_pretrained(
+                    local_model_path,
+                    torch_dtype=torch.float32,
+                ).to(device)
+                vae_loaded = True
+                print("成功從本地加載 VAE 模型")
+            except Exception as e:
+                print(f"從本地加載 VAE 失敗: {e}")
+        
+        # 2. 如果本地加載失敗，嘗試從網絡加載
+        if not vae_loaded:
+            try:
+                print(f"從網絡加載 VAE: {vae_model_id}/{vae_subfolder}")
+                self.vae = AutoencoderKL.from_pretrained(
+                    vae_model_id,
+                    subfolder=vae_subfolder,
+                    torch_dtype=torch.float32,
+                ).to(device)
+                vae_loaded = True
+                print("成功從網絡加載 VAE 模型")
+                
+                # 順便保存到本地以備未來使用
+                try:
+                    os.makedirs(local_model_path, exist_ok=True)
+                    self.vae.save_pretrained(local_model_path)
+                    print(f"已將 VAE 模型保存到: {local_model_path}")
+                except Exception as e:
+                    print(f"保存 VAE 模型到本地時出錯: {e}")
+            except Exception as e:
+                print(f"從網絡加載 VAE 失敗: {e}")
+        
+        # 3. 如果還是加載失敗，使用簡單的 VAE 初始化
+        if not vae_loaded:
+            print("無法加載預訓練 VAE，使用隨機初始化的 VAE")
+            self.vae = AutoencoderKL(
+                in_channels=3,
+                out_channels=3,
+                down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+                up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+                block_out_channels=(128, 256, 512, 512),
+                layers_per_block=2,
+                act_fn="silu",
+                latent_channels=unet_in_channels,
+                sample_size=unet_sample_size * 4,
+            ).to(device)
+        
+        # 再次確認 VAE 在正確設備上
+        for param in self.vae.parameters():
+            if param.device != device:
+                print(f"警告: VAE 參數在錯誤設備上: {param.device}")
+                param.data = param.data.to(device)
+                
+        # 凍結 VAE 參數
+        for param in self.vae.parameters():
+            param.requires_grad = False
+            
+        # VAE配置 - 使用SD縮放因子
+        self.vae_scale_factor = 0.18215  # SD VAE 的縮放因子
         
         # 設置UNet - 條件式去噪模型的核心
         self.unet = UNet2DConditionModel(
@@ -79,9 +162,17 @@ class ConditionalDiffusionModel(nn.Module):
         if images.min() >= 0 and images.max() <= 1:
             images = 2 * images - 1
             
-        # VAE 編碼
-        latents = self.vae.encode(images).latent_dist.sample()
-        # 縮放潛在表示 (不需要特殊縮放因子，直接使用)
+        # 使用上下文管理器避免計算梯度
+        with torch.no_grad():
+            # 明確設置 VAE 評估模式
+            self.vae.eval()
+            # 確保 VAE 在正確設備上
+            self.vae = self.vae.to(self.device)
+            
+            # VAE 編碼
+            latents = self.vae.encode(images).latent_dist.sample()
+            # 使用 SD VAE 的縮放因子
+            latents = latents * self.vae_scale_factor
         
         return latents
     
@@ -92,8 +183,18 @@ class ConditionalDiffusionModel(nn.Module):
         # 確保潛在表示在正確的設備上
         latents = latents.to(self.device)
         
-        # VAE 解碼
-        images = self.vae.decode(latents).sample
+        # 使用上下文管理器避免計算梯度
+        with torch.no_grad():
+            # 明確設置 VAE 評估模式
+            self.vae.eval()
+            # 確保 VAE 在正確設備上
+            self.vae = self.vae.to(self.device)
+            
+            # 使用 SD VAE 的反向縮放
+            latents = latents / self.vae_scale_factor
+            
+            # VAE 解碼
+            images = self.vae.decode(latents).sample
         
         # 調整到 [0, 1] 範圍
         images = (images + 1) / 2
@@ -260,6 +361,11 @@ class ConditionalDiffusionModel(nn.Module):
                     
                     # 使用評估器計算梯度
                     images.requires_grad = True
+                    
+                    # 確保評估器在正確設備上
+                    if hasattr(evaluator, 'resnet18'):
+                        evaluator.resnet18 = evaluator.resnet18.to(self.device)
+                    
                     logits = evaluator.resnet18(images)
                     
                     # 計算分類器損失
@@ -370,3 +476,9 @@ class ConditionalDiffusionModel(nn.Module):
         process_images = torch.stack(process_images)
         
         return process_images
+
+
+# 如果需要單獨執行下載功能
+if __name__ == "__main__":
+    # 下載並保存 VAE 模型
+    download_vae_model()

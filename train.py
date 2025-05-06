@@ -11,10 +11,12 @@ import logging
 import time
 from tqdm import tqdm
 import json
+from accelerate import Accelerator
 
-from models.model import ConditionalLDM
+from models.model import ConditionalDiffusionModel
 from evaluator import evaluation_model
 from data.dataset import get_dataloader
+from config import Config
 
 def setup_logger(log_dir):
     """設置日誌記錄器"""
@@ -52,6 +54,12 @@ def train(config):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.SEED)
     
+    # 初始化 Accelerator
+    accelerator = Accelerator(
+        mixed_precision="fp16" if config.FP16 else "no",
+        gradient_accumulation_steps=1,
+    )
+    
     # 加載資料
     train_loader, obj2idx = get_dataloader(config, train=True)
     logger.info(f"DataLoader created with {len(train_loader)} batches")
@@ -60,24 +68,13 @@ def train(config):
     evaluator = evaluation_model()
     
     # 創建模型
-    model = ConditionalLDM(
-        unet_dim=config.UNET_DIM,
-        condition_dim=config.CONDITION_DIM,
-        time_embedding_dim=config.TIME_EMBEDDING_DIM,
+    model = ConditionalDiffusionModel(
         num_classes=config.NUM_CLASSES,
-        use_attention=config.USE_ATTENTION,
-        image_size=config.IMAGE_SIZE,
-        channels=3,
-        latent_channels=config.LATENT_CHANNELS,
-        variational=True,
-        training=True
+        unet_in_channels=config.LATENT_CHANNELS,
+        unet_sample_size=config.IMAGE_SIZE // 4,  # 潛在空間大小
+        condition_embedding_dim=config.CONDITION_DIM,
+        device=device,
     )
-    model = model.to(device)
-    
-    # 如果有多個GPU，使用DataParallel
-    if torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs for training")
-        model = nn.DataParallel(model)
     
     # 設置優化器
     optimizer = AdamW(
@@ -93,8 +90,8 @@ def train(config):
         eta_min=1e-5
     )
     
-    # 混合精度訓練
-    scaler = torch.amp.GradScaler('cuda') if config.FP16 else None
+    # 使用 Accelerator 準備模型、優化器、資料加載器
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     
     # 訓練循環
     global_step = 0
@@ -103,68 +100,36 @@ def train(config):
     for epoch in range(config.NUM_EPOCHS):
         model.train()
         epoch_loss = 0
-        epoch_mse_loss = 0
-        epoch_kl_loss = 0
         
         # 進度條
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS}")
         
         for batch_idx, (images, labels) in enumerate(progress_bar):
-            images, labels = images.to(device), labels.to(device)
-            
-            # 混合精度訓練
-            if config.FP16:
-                # with torch.cuda.amp.autocast():
-                with torch.amp.autocast('cuda'):
-                    loss, mse_loss, kl_loss = model(images, labels)
-                    
-                    # 如果使用DataParallel，需要取平均
-                    if isinstance(loss, torch.Tensor) and loss.dim() > 0:
-                        loss = loss.mean()
-                        mse_loss = mse_loss.mean()
-                        kl_loss = kl_loss.mean()
+            with accelerator.accumulate(model):
+                # 計算損失
+                loss = model(images, labels)
                 
-                # 反向傳播
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                
-                # 梯度裁剪
-                if config.GRAD_CLIP > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
-                
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # 標準訓練
-                loss, mse_loss, kl_loss = model(images, labels)
-                
-                # 如果使用DataParallel，需要取平均
+                # 如果使用 DataParallel，需要取平均
                 if isinstance(loss, torch.Tensor) and loss.dim() > 0:
                     loss = loss.mean()
-                    mse_loss = mse_loss.mean()
-                    kl_loss = kl_loss.mean()
                 
                 # 反向傳播
-                optimizer.zero_grad()
-                loss.backward()
+                accelerator.backward(loss)
                 
                 # 梯度裁剪
                 if config.GRAD_CLIP > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
+                    accelerator.clip_grad_norm_(model.parameters(), config.GRAD_CLIP)
                     
+                # 優化器步驟
                 optimizer.step()
+                optimizer.zero_grad()
             
             # 更新進度條
             epoch_loss += loss.item()
-            epoch_mse_loss += mse_loss.item()
-            epoch_kl_loss += kl_loss.item()
             
             # 顯示當前損失
             progress_bar.set_postfix({
                 'loss': loss.item(),
-                'mse_loss': mse_loss.item(),
-                'kl_loss': kl_loss.item()
             })
             
             global_step += 1
@@ -178,48 +143,45 @@ def train(config):
         
         # 計算平均損失
         avg_loss = epoch_loss / len(train_loader)
-        avg_mse_loss = epoch_mse_loss / len(train_loader)
-        avg_kl_loss = epoch_kl_loss / len(train_loader)
         
-        logger.info(f"Epoch {epoch+1}/{config.NUM_EPOCHS}, Avg Loss: {avg_loss:.6f}, MSE: {avg_mse_loss:.6f}, KL: {avg_kl_loss:.6f}")
+        logger.info(f"Epoch {epoch+1}/{config.NUM_EPOCHS}, Avg Loss: {avg_loss:.6f}")
         
         # 保存模型
         if avg_loss < best_loss:
             best_loss = avg_loss
-            save_checkpoint(model, optimizer, scheduler, epoch, global_step, best_loss, config, is_best=True)
+            save_checkpoint(accelerator.unwrap_model(model), optimizer, scheduler, epoch, global_step, best_loss, config, is_best=True)
             logger.info(f"Saved best model with loss {best_loss:.6f}")
         
         # 每5個epoch保存一個檢查點
         if (epoch + 1) % 5 == 0:
-            save_checkpoint(model, optimizer, scheduler, epoch, global_step, avg_loss, config)
+            save_checkpoint(accelerator.unwrap_model(model), optimizer, scheduler, epoch, global_step, avg_loss, config)
             logger.info(f"Saved checkpoint at epoch {epoch+1}")
             
             # 評估當前模型
-            evaluate(model, evaluator, config, epoch)
+            evaluate(accelerator.unwrap_model(model), evaluator, config, epoch)
     
     logger.info("Training completed!")
     
     # 最終評估
-    evaluate(model, evaluator, config, config.NUM_EPOCHS)
+    evaluate(accelerator.unwrap_model(model), evaluator, config, config.NUM_EPOCHS)
 
 def save_sample(model, labels, epoch, step, config):
     """
     儲存生成的樣本圖片
     """
-    model.eval()
-    with torch.no_grad():
-        # 如果model是DataParallel，使用model.module
-        if isinstance(model, nn.DataParallel):
-            sample_model = model.module
-        else:
-            sample_model = model
+    # 如果model是DataParallel或被accelerator包裝，使用unwrap_model
+    if hasattr(model, "module"):  # DataParallel
+        sample_model = model.module
+    else:
+        sample_model = model
             
-        # 生成圖片
+    # 生成圖片
+    sample_model.eval()
+    with torch.no_grad():
         samples = sample_model.sample(
             labels.to(config.DEVICE),
             guidance_scale=config.GUIDANCE_SCALE,
             num_inference_steps=config.NUM_INFERENCE_STEPS // 2,  # 使用更少步數加快採樣
-            device=config.DEVICE
         )
         
         # 保存圖片
@@ -227,23 +189,17 @@ def save_sample(model, labels, epoch, step, config):
         os.makedirs(save_dir, exist_ok=True)
         save_image(samples, os.path.join(save_dir, f"sample_e{epoch+1}_s{step}.png"), nrow=2)
     
-    model.train()
+    sample_model.train()
 
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss, config, is_best=False):
     """
     保存模型檢查點
     """
-    # 如果model是DataParallel，保存model.module
-    if isinstance(model, nn.DataParallel):
-        model_state = model.module.state_dict()
-    else:
-        model_state = model.state_dict()
-    
     checkpoint = {
         'epoch': epoch + 1,
         'global_step': global_step,
         'loss': loss,
-        'model': model_state,
+        'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict() if scheduler else None,
         'config': vars(config)
@@ -267,29 +223,21 @@ def evaluate(model, evaluator, config, epoch):
     # 將model設置為評估模式
     model.eval()
     
-    # 如果model是DataParallel，使用model.module
-    if isinstance(model, nn.DataParallel):
-        sample_model = model.module
-    else:
-        sample_model = model
-    
     # 生成測試圖像
-    test_images = sample_model.sample(
+    test_images = model.sample(
         test_labels.to(config.DEVICE),
         evaluator=evaluator,
         guidance_scale=config.GUIDANCE_SCALE,
         classifier_scale=config.CLASSIFIER_GUIDANCE_SCALE,
         num_inference_steps=config.NUM_INFERENCE_STEPS,
-        device=config.DEVICE
     )
     
-    new_test_images = sample_model.sample(
+    new_test_images = model.sample(
         new_test_labels.to(config.DEVICE),
         evaluator=evaluator,
         guidance_scale=config.GUIDANCE_SCALE,
         classifier_scale=config.CLASSIFIER_GUIDANCE_SCALE,
         num_inference_steps=config.NUM_INFERENCE_STEPS,
-        device=config.DEVICE
     )
     
     # 評估準確率

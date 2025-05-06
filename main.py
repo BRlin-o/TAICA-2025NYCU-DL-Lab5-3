@@ -6,6 +6,7 @@ from train import train
 from sample import generate_test_images, load_model
 from evaluator import evaluation_model
 from utils.helpers import set_seed
+import logging
 
 def main():
     """主程序入口"""
@@ -42,16 +43,27 @@ def main():
     
     # 創建必要的目錄
     config.create_directories()
+
+    # 設置日誌
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(config.OUTPUT_DIR, "main.log")),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger("main")
     
     # 設置隨機種子
     set_seed(config.SEED)
     
     if args.mode == 'train':
-        print("開始訓練 Conditional DDPM 模型...")
+        logger.info("開始訓練 Conditional DDPM 模型...")
         train(config)
         
     elif args.mode == 'sample':
-        print("採樣生成圖像...")
+        logger.info("採樣生成圖像...")
         # 檢查點路徑
         checkpoint_path = args.checkpoint if args.checkpoint else os.path.join(config.CHECKPOINT_DIR, "model_best.pth")
         
@@ -60,12 +72,12 @@ def main():
         
         # 加載模型
         model, epoch = load_model(checkpoint_path, config)
-        print(f"已加載來自 epoch {epoch} 的模型")
+        logger.info(f"已加載來自 epoch {epoch} 的模型")
         
         # 生成圖像
         generate_test_images(model, config, evaluator)
         
-        print("生成完成！圖像已保存")
+        logger.info("生成完成！圖像已保存")
 
 if __name__ == "__main__":
     main()

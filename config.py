@@ -17,18 +17,18 @@ class Config:
     
     # 模型架構參數
     LATENT_CHANNELS = 4  # 潛在空間的通道數
-    ENCODER_SCALE_FACTOR = 4  # 編碼器下採樣因子
+    # ENCODER_SCALE_FACTOR = 4  # 編碼器下採樣因子
     CONDITION_DIM = 256  # 條件嵌入維度
-    TIME_EMBEDDING_DIM = 256  # 時間嵌入維度
-    UNET_DIM = 128  # UNet基礎維度
+    # TIME_EMBEDDING_DIM = 256  # 時間嵌入維度
+    # UNET_DIM = 128  # UNet基礎維度
     NUM_CLASSES = 24  # 物件類別數
-    USE_ATTENTION = True  # 使用交叉注意力
+    # USE_ATTENTION = True  # 使用交叉注意力
     
     # 擴散過程參數
     NUM_TRAIN_TIMESTEPS = 1000
     NUM_INFERENCE_STEPS = 50  # DDIM採樣步數
-    BETA_SCHEDULE = "linear"  # 可選: linear, cosine
-    PREDICTION_TYPE = "epsilon"  # 預測噪聲
+    # BETA_SCHEDULE = "linear"  # 可選: linear, cosine
+    # PREDICTION_TYPE = "epsilon"  # 預測噪聲
     
     # 訓練參數
     BATCH_SIZE = 64  # RTX 3090可以用更大的批次如128
