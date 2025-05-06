@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import logging
 
-# from models.model import ConditionalDiffusionModel
-from models.model_sd import ConditionalDiffusionModel
+from models.model import ConditionalDiffusionModel
+# from models.model_sd import ConditionalDiffusionModel
 from evaluator import evaluation_model
 from data.dataset import get_dataloader
 from config import Config
