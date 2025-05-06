@@ -26,7 +26,7 @@ class Config:
     
     # 擴散過程參數
     NUM_TRAIN_TIMESTEPS = 1000
-    NUM_INFERENCE_STEPS = 50  # DDIM採樣步數
+    NUM_INFERENCE_STEPS = 100  # DDIM採樣步數
     # BETA_SCHEDULE = "linear"  # 可選: linear, cosine
     # PREDICTION_TYPE = "epsilon"  # 預測噪聲
     
@@ -44,8 +44,8 @@ class Config:
     NUM_WORKERS = 8
     
     # 採樣參數
-    GUIDANCE_SCALE = 5.0  # Classifier-free guidance強度
-    CLASSIFIER_GUIDANCE_SCALE = 1  # 分類器引導強度
+    GUIDANCE_SCALE = 4.25  # Classifier-free guidance強度
+    CLASSIFIER_GUIDANCE_SCALE = 0.75  # 分類器引導強度
     
     # 創建必要的目錄
     @staticmethod

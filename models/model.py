@@ -117,6 +117,10 @@ class ConditionalDiffusionModel(nn.Module):
                 latent_channels=unet_in_channels,
                 sample_size=unet_sample_size * 2,
             ).to(device)
+
+            self.vae_scale_factor = 4  # VAE 的縮放因子
+        else:
+            self.vae_scale_factor = 0.18215  # SD VAE 的縮放因子
         
         # 再次確認 VAE 在正確設備上
         for param in self.vae.parameters():
@@ -127,9 +131,6 @@ class ConditionalDiffusionModel(nn.Module):
         # 凍結 VAE 參數
         for param in self.vae.parameters():
             param.requires_grad = False
-            
-        # VAE配置 - 使用SD縮放因子
-        self.vae_scale_factor = 0.18215  # SD VAE 的縮放因子
         
         # 設置UNet - 條件式去噪模型的核心
         self.unet = UNet2DConditionModel(
@@ -137,11 +138,14 @@ class ConditionalDiffusionModel(nn.Module):
             in_channels=unet_in_channels,
             out_channels=unet_in_channels,
             layers_per_block=2,
-            block_out_channels=(128, 256, 512, 512),
-            down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
-            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+            # block_out_channels=(128, 256, 512, 512),
+            # down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
+            # up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(64, 128, 256),
+            down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
             cross_attention_dim=condition_embedding_dim,
-            attention_head_dim=64,  # 增加注意力頭維度
+            attention_head_dim=24,  # 增加注意力頭維度
             dropout=0.1,  # 添加適量的dropout
         ).to(device)
         
@@ -381,16 +385,16 @@ class ConditionalDiffusionModel(nn.Module):
                     logits = evaluator.resnet18(norm_images)
                     
                     # 計算分類器損失
-                    # cls_loss = -torch.sum(logits * conditions, dim=1).mean()
-                    cls_loss = -torch.sum(logits * conditions, dim=1).mean() * 2.0
+                    cls_loss = -torch.sum(logits * conditions, dim=1).mean()
+                    # cls_loss = -torch.sum(logits * conditions, dim=1).mean() * 2.0
                     
                     # 確保損失有梯度，並計算梯度
                     if cls_loss.requires_grad:
                         grad = torch.autograd.grad(cls_loss, images, create_graph=False)[0]
                         
                         # 縮放梯度並應用到潛在表示
-                        # grad_scale = classifier_scale * (1000 - t.item()) / 1000  # 隨著t減小而縮小
-                        grad_scale = classifier_scale * (1 - i / len(scheduler.timesteps))
+                        grad_scale = classifier_scale * (1000 - t.item()) / 1000  # 隨著t減小而縮小
+                        # grad_scale = classifier_scale * (1 - i / len(scheduler.timesteps))
                         
                         # 修正潛在向量
                         with torch.no_grad():
@@ -399,8 +403,8 @@ class ConditionalDiffusionModel(nn.Module):
                             latent_orig = self.encode(images)
                             
                             # 應用到潛在表示
-                            # latents = latents - 0.1 * (latent_grad - latent_orig)
-                            latents = latents - 0.2 * (latent_grad - latent_orig)
+                            latents = latents - 0.1 * (latent_grad - latent_orig)
+                            # latents = latents - 0.2 * (latent_grad - latent_orig)
                     else:
                         print(f"警告: 分類器損失沒有梯度，跳過分類器引導 (t={t})")
                 except Exception as e:

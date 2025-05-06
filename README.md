@@ -42,6 +42,8 @@
 
 ```bash
 python main.py --mode train --batch_size 128 --epochs 100
+
+python main.py --mode train --batch_size 64 --epochs 100
 ```
 
 ## 生成圖像
