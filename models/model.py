@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from .encoder import Encoder, EncoderWithVariational
 from .decoder import Decoder
-from .unet import UNetWithCrossAttention
+from .unet import UNet
 from .diffusion import DDPMScheduler, DDIMScheduler
 
 class ConditionalLDM(nn.Module):
@@ -62,16 +62,15 @@ class ConditionalLDM(nn.Module):
         self.time_embedding_dim = time_embedding_dim
         
         # UNet骨幹
-        self.unet = UNetWithCrossAttention(
+        self.unet = UNet(
             in_channels=latent_channels,
             model_channels=unet_dim,
             out_channels=latent_channels,
             num_res_blocks=2,
             attention_resolutions=(8, 4),
-            channel_mults=(1, 2, 4, 8),
+            channel_mult=(1, 2, 4, 8),
             time_embedding_dim=time_embedding_dim,
-            condition_dim=condition_dim,
-            use_attention=use_attention
+            condition_dim=condition_dim
         )
         
         # 噪聲排程器

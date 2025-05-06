@@ -94,7 +94,7 @@ def train(config):
     )
     
     # 混合精度訓練
-    scaler = torch.cuda.amp.GradScaler() if config.FP16 else None
+    scaler = torch.amp.GradScaler('cuda') if config.FP16 else None
     
     # 訓練循環
     global_step = 0
@@ -114,7 +114,8 @@ def train(config):
             
             # 混合精度訓練
             if config.FP16:
-                with torch.cuda.amp.autocast():
+                # with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     loss, mse_loss, kl_loss = model(images, labels)
                     
                     # 如果使用DataParallel，需要取平均

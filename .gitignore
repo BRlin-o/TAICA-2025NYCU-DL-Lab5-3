@@ -9,3 +9,5 @@ wheels/
 # venv
 .venv
 iclevr/*.png
+output/*.log
+output/*/

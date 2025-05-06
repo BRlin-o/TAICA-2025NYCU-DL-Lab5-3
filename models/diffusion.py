@@ -54,7 +54,7 @@ class DDPMScheduler:
         self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod.roll(1, 0)) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod)
         
         # 設置時間步的轉換係數
-        self.timesteps = torch.arange(0, num_train_timesteps).float()[::-1].clone()
+        self.timesteps = torch.arange(num_train_timesteps-1, -1, -1).float().clone()
     
     def set_timesteps(self, num_inference_steps, device="cpu"):
         """
@@ -65,6 +65,17 @@ class DDPMScheduler:
         timesteps = timesteps.to(device).long()
         self.timesteps = timesteps
         
+        # 將所有相關張量移到指定的設備
+        self.betas = self.betas.to(device)
+        self.alphas = self.alphas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        self.posterior_variance = self.posterior_variance.to(device)
+        self.posterior_log_variance = self.posterior_log_variance.to(device)
+        self.posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
+        self.posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
+        
         return timesteps
     
     def add_noise(self, original_samples, noise, timesteps):
@@ -72,8 +83,13 @@ class DDPMScheduler:
         根據時間步 t 添加噪聲到原始樣本
         x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * epsilon
         """
-        sqrt_alpha_cumprod = self.sqrt_alphas_cumprod[timesteps].to(original_samples.device)
-        sqrt_one_minus_alpha_cumprod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(original_samples.device)
+        # 確保時間步與自身張量在同一設備上
+        device = original_samples.device
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        
+        sqrt_alpha_cumprod = self.sqrt_alphas_cumprod[timesteps]
+        sqrt_one_minus_alpha_cumprod = self.sqrt_one_minus_alphas_cumprod[timesteps]
         
         # 添加適當的維度以支持批處理
         sqrt_alpha_cumprod = sqrt_alpha_cumprod.reshape(-1, 1, 1, 1)
@@ -88,6 +104,13 @@ class DDPMScheduler:
         """
         計算後驗分佈 q(x_{t-1} | x_t, x_0) 的均值和方差
         """
+        # 確保在同一設備上
+        device = x_0.device
+        self.posterior_mean_coef1 = self.posterior_mean_coef1.to(device)
+        self.posterior_mean_coef2 = self.posterior_mean_coef2.to(device)
+        self.posterior_variance = self.posterior_variance.to(device)
+        self.posterior_log_variance = self.posterior_log_variance.to(device)
+        
         posterior_mean = (
             self.posterior_mean_coef1[t].reshape(-1, 1, 1, 1) * x_0 +
             self.posterior_mean_coef2[t].reshape(-1, 1, 1, 1) * x_t
@@ -104,12 +127,15 @@ class DDPMScheduler:
         if prev_timestep is None:
             prev_timestep = timestep - 1
         
+        device = sample.device
+        
         # 用於數值穩定性的夾值
-        prev_timestep = torch.max(torch.tensor(0), prev_timestep)
+        prev_timestep = torch.max(torch.tensor(0, device=device), prev_timestep)
         
         # 1. 根據模型輸出類型計算前一步的預測樣本x_0
         if self.prediction_type == "epsilon":
             # 如果預測噪聲 (epsilon)
+            self.alphas_cumprod = self.alphas_cumprod.to(device)
             alpha_prod_t = self.alphas_cumprod[timestep]
             beta_prod_t = 1 - alpha_prod_t
             
@@ -132,6 +158,7 @@ class DDPMScheduler:
                 
         elif self.prediction_type == "v_prediction":
             # 如果預測速度 v
+            self.alphas_cumprod = self.alphas_cumprod.to(device)
             alpha_prod_t = self.alphas_cumprod[timestep]
             beta_prod_t = 1 - alpha_prod_t
             
@@ -216,7 +243,7 @@ class DDIMScheduler:
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
         
         # 初始化時間步
-        self.timesteps = torch.arange(0, num_train_timesteps).float()[::-1].clone()
+        self.timesteps = torch.arange(num_train_timesteps-1, -1, -1).float().clone()
     
     def set_timesteps(self, num_inference_steps, device="cpu"):
         """
@@ -228,6 +255,13 @@ class DDIMScheduler:
         timesteps = timesteps.to(device).long()
         self.timesteps = timesteps
         
+        # 將所有相關張量移到指定的設備
+        self.betas = self.betas.to(device)
+        self.alphas = self.alphas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        
         return timesteps
     
     def add_noise(self, original_samples, noise, timesteps):
@@ -235,8 +269,13 @@ class DDIMScheduler:
         根據時間步 t 添加噪聲到原始樣本
         x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * epsilon
         """
-        sqrt_alpha_cumprod = self.sqrt_alphas_cumprod[timesteps].to(original_samples.device)
-        sqrt_one_minus_alpha_cumprod = self.sqrt_one_minus_alphas_cumprod[timesteps].to(original_samples.device)
+        # 確保時間步與自身張量在同一設備上
+        device = original_samples.device
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        
+        sqrt_alpha_cumprod = self.sqrt_alphas_cumprod[timesteps]
+        sqrt_one_minus_alpha_cumprod = self.sqrt_one_minus_alphas_cumprod[timesteps]
         
         # 添加適當的維度以支持批處理
         sqrt_alpha_cumprod = sqrt_alpha_cumprod.reshape(-1, 1, 1, 1)
@@ -254,10 +293,13 @@ class DDIMScheduler:
         if prev_timestep is None:
             prev_timestep = timestep - 1
         
+        device = sample.device
+        
         # 用於數值穩定性的夾值
-        prev_timestep = torch.max(torch.tensor(0), prev_timestep)
+        prev_timestep = torch.max(torch.tensor(0, device=device), prev_timestep)
         
         # 獲取 alpha 相關參數
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
         alpha_cumprod_t = self.alphas_cumprod[timestep]
         alpha_cumprod_prev = self.alphas_cumprod[prev_timestep]
         

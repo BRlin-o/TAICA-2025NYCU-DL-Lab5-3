@@ -25,299 +25,287 @@ class SinusoidalPositionEmbeddings(nn.Module):
             
         return embeddings
 
-class ResidualBlock(nn.Module):
-    """
-    殘差塊，用於UNet的下採樣和上採樣路徑
-    """
-    def __init__(self, in_channels, out_channels, time_dim=None, *, kernel_size=3, stride=1, padding=1, groups=8):
+class ResBlock(nn.Module):
+    """殘差區塊，支援時間條件"""
+    def __init__(self, in_ch, out_ch, time_emb_dim=None, dropout=0.1):
         super().__init__()
-        self.time_dim = time_dim
-        
-        # 時間嵌入的處理
-        if time_dim is not None:
-            self.time_mlp = nn.Sequential(
-                nn.GELU(),
-                nn.Linear(time_dim, out_channels)
-            )
-        
-        # 主要卷積路徑
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        self.norm1 = nn.GroupNorm(groups, out_channels)
-        self.act1 = nn.GELU()
-        
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, stride, padding)
-        self.norm2 = nn.GroupNorm(groups, out_channels)
-        self.act2 = nn.GELU()
-        
-        # 殘差連接
-        self.residual = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        
-    def forward(self, x, time_emb=None):
-        # 主路徑
-        h = self.conv1(x)
-        h = self.norm1(h)
-        h = self.act1(h)
-        
-        # 添加時間嵌入
-        if self.time_dim is not None and time_emb is not None:
-            time_token = self.time_mlp(time_emb)
-            h = h + time_token.reshape(time_token.shape[0], -1, 1, 1)
-        
-        h = self.conv2(h)
-        h = self.norm2(h)
-        h = self.act2(h)
-        
-        # 殘差連接
-        return h + self.residual(x)
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_ch)
+        ) if time_emb_dim is not None else None
 
-class CrossAttention(nn.Module):
-    """
-    交叉注意力模組，用於UNet中注入條件信息
-    """
-    def __init__(self, query_dim, context_dim, heads=8, dim_head=64, dropout=0.0):
-        super().__init__()
-        inner_dim = dim_head * heads
-        context_dim = context_dim if context_dim is not None else query_dim
-        
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-        
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim),
-            nn.Dropout(dropout)
+        self.block1 = nn.Sequential(
+            nn.GroupNorm(32, in_ch),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1)
         )
         
-        self.norm = nn.LayerNorm(query_dim)
+        self.block2 = nn.Sequential(
+            nn.GroupNorm(32, out_ch),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        )
         
-    def forward(self, x, context=None):
-        batch_size, c, h, w = x.shape
+        if in_ch != out_ch:
+            self.shortcut = nn.Conv2d(in_ch, out_ch, 1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x, time_emb=None):
+        h = self.block1(x)
         
-        # 重塑張量為注意力操作格式：[batch, h*w, channels]
-        q_input = x.permute(0, 2, 3, 1).reshape(batch_size, h * w, c)
-        q_input = self.norm(q_input)
+        if self.time_mlp is not None and time_emb is not None:
+            time_emb = self.time_mlp(time_emb)
+            h = h + time_emb.reshape(time_emb.shape[0], -1, 1, 1)
+            
+        h = self.block2(h)
+        return h + self.shortcut(x)
+
+class AttentionBlock(nn.Module):
+    """注意力區塊"""
+    def __init__(self, channels, num_heads=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
         
-        # 如果沒有提供context，使用自注意力
-        context = context if context is not None else q_input
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
         
-        # 產生查詢、鍵、值
-        q = self.to_q(q_input)
-        k = self.to_k(context)
-        v = self.to_v(context)
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # 標準化
+        x_norm = self.norm(x)
+        
+        # 計算Q, K, V
+        qkv = self.qkv(x_norm)
+        q, k, v = torch.chunk(qkv, 3, dim=1)
         
         # 重塑為多頭格式
-        q = q.reshape(batch_size, -1, self.heads, q.shape[-1] // self.heads).permute(0, 2, 1, 3)
-        k = k.reshape(batch_size, -1, self.heads, k.shape[-1] // self.heads).permute(0, 2, 1, 3)
-        v = v.reshape(batch_size, -1, self.heads, v.shape[-1] // self.heads).permute(0, 2, 1, 3)
+        q = q.reshape(B, self.num_heads, self.head_dim, H * W)
+        k = k.reshape(B, self.num_heads, self.head_dim, H * W)
+        v = v.reshape(B, self.num_heads, self.head_dim, H * W)
         
-        # 注意力操作
-        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        # 計算注意力
+        attn = torch.einsum('bhcn,bhcm->bhnm', q, k) * (self.head_dim ** -0.5)
         attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
         
-        # 重塑回原始格式
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, h * w, -1)
-        out = self.to_out(out)
+        # 應用注意力得到輸出
+        out = torch.einsum('bhnm,bhcm->bhcn', attn, v)
         
-        # 添加殘差連接並重塑回空間格式 [batch, channel, height, width]
-        out = out + q_input
-        out = out.reshape(batch_size, h, w, c).permute(0, 3, 1, 2)
+        # 重塑回原始形狀
+        out = out.reshape(B, C, H, W)
         
-        return out
+        # 投影並應用殘差連接
+        return x + self.proj(out)
 
-class UNetWithCrossAttention(nn.Module):
+class CrossAttentionBlock(nn.Module):
+    """交叉注意力區塊，用於注入條件信息"""
+    def __init__(self, channels, cond_dim, num_heads=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        
+        self.norm = nn.GroupNorm(32, channels)
+        self.q = nn.Conv2d(channels, channels, 1)
+        self.k = nn.Linear(cond_dim, channels)
+        self.v = nn.Linear(cond_dim, channels)
+        
+        self.proj = nn.Conv2d(channels, channels, 1)
+        
+    def forward(self, x, cond):
+        B, C, H, W = x.shape
+        
+        # 標準化
+        x_norm = self.norm(x)
+        
+        # 計算Q, K, V
+        q = self.q(x_norm).reshape(B, self.num_heads, self.head_dim, H * W)
+        k = self.k(cond).reshape(B, self.num_heads, self.head_dim, -1)
+        v = self.v(cond).reshape(B, self.num_heads, self.head_dim, -1)
+        
+        # 計算注意力
+        attn = torch.einsum('bhcn,bhcm->bhnm', q, k) * (self.head_dim ** -0.5)
+        attn = F.softmax(attn, dim=-1)
+        
+        # 應用注意力得到輸出
+        out = torch.einsum('bhnm,bhcm->bhcn', attn, v)
+        
+        # 重塑回原始形狀
+        out = out.reshape(B, C, H, W)
+        
+        # 投影並應用殘差連接
+        return x + self.proj(out)
+
+class Downsample(nn.Module):
+    """下採樣層"""
+    def __init__(self, channels):
+        super().__init__()
+        self.op = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
+        
+    def forward(self, x):
+        return self.op(x)
+
+class Upsample(nn.Module):
+    """上採樣層"""
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+        
+    def forward(self, x):
+        # 使用近鄰插值而非雙線性插值，以避免尺寸不匹配問題
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.conv(x)
+
+class UNet(nn.Module):
     """
-    帶有交叉注意力的UNet模型，用於條件式擴散模型
+    簡化版UNet，專為穩定擴散設計
     """
     def __init__(
         self,
-        in_channels=4,
-        model_channels=128,
-        out_channels=4,
-        num_res_blocks=2,
-        attention_resolutions=(8, 4),
-        channel_mults=(1, 2, 4, 8),
-        dropout=0.0,
-        time_embedding_dim=256,
-        condition_dim=256,
-        use_checkpoint=False,
-        use_attention=True,
+        in_channels=4,             # 輸入通道數
+        model_channels=128,        # 基礎通道數
+        out_channels=4,            # 輸出通道數
+        num_res_blocks=2,          # 每個解析度的殘差塊數量
+        attention_resolutions=(8, 4),  # 使用注意力的解析度
+        dropout=0.0,              # Dropout比率
+        channel_mult=(1, 2, 4, 8),  # 各層級通道乘數
+        time_embedding_dim=256,    # 時間嵌入維度
+        condition_dim=256         # 條件維度
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.model_channels = model_channels
-        self.out_channels = out_channels
-        self.num_res_blocks = num_res_blocks
-        self.attention_resolutions = attention_resolutions
-        self.dropout = dropout
-        self.channel_mults = channel_mults
-        self.use_checkpoint = use_checkpoint
-        self.use_attention = use_attention
-        self.time_embedding_dim = time_embedding_dim
-        self.condition_dim = condition_dim
         
-        # 時間嵌入
-        self.time_embedding = nn.Sequential(
+        time_embed_dim = time_embedding_dim
+        self.time_embed = nn.Sequential(
             SinusoidalPositionEmbeddings(model_channels),
-            nn.Linear(model_channels, time_embedding_dim),
-            nn.GELU(),
-            nn.Linear(time_embedding_dim, time_embedding_dim),
+            nn.Linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
         )
         
-        # 條件嵌入
-        self.condition_embedding = nn.Sequential(
-            nn.Linear(24, condition_dim),  # 假設輸入為24維的one-hot向量
-            nn.GELU(),
-            nn.Linear(condition_dim, condition_dim),
-        )
+        self.has_condition = condition_dim > 0
         
-        # 初始卷積層
-        self.input_conv = nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1)
+        # 輸入卷積
+        self.input_blocks = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(in_channels, model_channels, 3, padding=1))
+        ])
         
-        # 下採樣路徑
-        self.down_blocks = nn.ModuleList()
+        # 下採樣部分
+        input_block_chans = [model_channels]
+        ch = model_channels
         
-        # 記錄每個解析度的通道數
-        channels = [model_channels]
-        
-        # 當前通道數
-        current_channels = model_channels
-        
-        # 下採樣塊
-        for i, mult in enumerate(channel_mults):
-            out_channels = model_channels * mult
-            
-            # 每個解析度有num_res_blocks個殘差塊
+        for level, mult in enumerate(channel_mult):
             for _ in range(num_res_blocks):
-                self.down_blocks.append(
-                    ResidualBlock(
-                        current_channels, 
-                        out_channels,
-                        time_dim=time_embedding_dim
-                    )
-                )
-                current_channels = out_channels
-                channels.append(current_channels)
+                layers = [ResBlock(ch, model_channels * mult, time_embed_dim, dropout)]
+                ch = model_channels * mult
                 
-                # 在指定的解析度添加注意力機制
-                if self.use_attention and i in attention_resolutions:
-                    self.down_blocks.append(
-                        CrossAttention(
-                            current_channels, 
-                            condition_dim,
-                            heads=8,
-                            dim_head=64,
-                            dropout=dropout
-                        )
-                    )
+                # 在特定解析度添加注意力層
+                if mult * model_channels in attention_resolutions:
+                    layers.append(AttentionBlock(ch))
+                    if self.has_condition:
+                        layers.append(CrossAttentionBlock(ch, condition_dim))
                 
-            # 如果不是最後一個下採樣塊，添加下採樣層
-            if i != len(channel_mults) - 1:
-                self.down_blocks.append(nn.Conv2d(current_channels, current_channels, 4, 2, 1))
-        
-        # 中間塊 - 底部的塊
-        self.middle_block1 = ResidualBlock(current_channels, current_channels, time_embedding_dim)
-        self.middle_attn = CrossAttention(current_channels, condition_dim) if use_attention else nn.Identity()
-        self.middle_block2 = ResidualBlock(current_channels, current_channels, time_embedding_dim)
-        
-        # 上採樣路徑
-        self.up_blocks = nn.ModuleList()
-        
-        # 上採樣塊，注意跳躍連接
-        for i, mult in reversed(list(enumerate(channel_mults))):
-            out_channels = model_channels * mult
+                self.input_blocks.append(nn.Sequential(*layers))
+                input_block_chans.append(ch)
             
-            # 每個解析度有num_res_blocks個殘差塊，再加上跳躍連接
-            for j in range(num_res_blocks + 1):
-                # 使用跳躍連接
-                skip_channels = channels.pop() if j > 0 else 0
-                self.up_blocks.append(
-                    ResidualBlock(
-                        current_channels + skip_channels,
-                        out_channels,
-                        time_dim=time_embedding_dim
+            # 除了最後一層，都添加下採樣
+            if level != len(channel_mult) - 1:
+                self.input_blocks.append(nn.Sequential(Downsample(ch)))
+                input_block_chans.append(ch)
+        
+        # 中間部分
+        self.middle_block = nn.Sequential(
+            ResBlock(ch, ch, time_embed_dim, dropout),
+            AttentionBlock(ch),
+            *([] if not self.has_condition else [CrossAttentionBlock(ch, condition_dim)]),
+            ResBlock(ch, ch, time_embed_dim, dropout)
+        )
+        
+        # 上採樣部分
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(channel_mult))[::-1]:
+            for i in range(num_res_blocks + 1):
+                layers = [
+                    ResBlock(
+                        ch + input_block_chans.pop(),
+                        model_channels * mult,
+                        time_embed_dim,
+                        dropout
                     )
-                )
-                current_channels = out_channels
+                ]
+                ch = model_channels * mult
                 
-                # 在指定的解析度添加注意力機制
-                if self.use_attention and i in attention_resolutions:
-                    self.up_blocks.append(
-                        CrossAttention(
-                            current_channels, 
-                            condition_dim,
-                            heads=8,
-                            dim_head=64,
-                            dropout=dropout
-                        )
-                    )
+                # 在特定解析度添加注意力層
+                if mult * model_channels in attention_resolutions:
+                    layers.append(AttentionBlock(ch))
+                    if self.has_condition:
+                        layers.append(CrossAttentionBlock(ch, condition_dim))
                 
-            # 如果不是最後一個上採樣塊，添加上採樣層
-            if i > 0:
-                self.up_blocks.append(
-                    nn.Sequential(
-                        nn.Upsample(scale_factor=2, mode='nearest'),
-                        nn.Conv2d(current_channels, current_channels, 3, padding=1)
-                    )
-                )
+                # 除了最後一層，都添加上採樣
+                if level > 0 and i == num_res_blocks:
+                    layers.append(Upsample(ch))
+                
+                self.output_blocks.append(nn.Sequential(*layers))
         
         # 最終輸出層
         self.out = nn.Sequential(
-            nn.GroupNorm(8, current_channels),
-            nn.GELU(),
-            nn.Conv2d(current_channels, out_channels, 3, padding=1)
+            nn.GroupNorm(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, out_channels, 3, padding=1),
         )
+    
+    def forward(self, x, timesteps, condition=None):
+        """
+        前向傳播函數
         
-    def forward(self, x, time, condition):
+        Args:
+            x (torch.Tensor): 輸入張量，形狀為 [B, C, H, W]
+            timesteps (torch.Tensor): 時間步，形狀為 [B]
+            condition (torch.Tensor, optional): 條件嵌入，形狀為 [B, cond_dim]
+            
+        Returns:
+            torch.Tensor: 預測的噪聲或原始樣本
+        """
         # 時間嵌入
-        time_emb = self.time_embedding(time)
+        emb = self.time_embed(timesteps)
         
-        # 條件嵌入
-        if condition.shape[-1] != self.condition_dim:
-            cond_emb = self.condition_embedding(condition)
-        else:
-            cond_emb = condition
-        
-        # 初始特徵提取
-        h = self.input_conv(x)
-        
-        # 儲存中間特徵用於跳躍連接
+        # 初始特徵
+        h = self.input_blocks[0](x)
         hs = [h]
         
         # 下採樣路徑
-        for module in self.down_blocks:
-            if isinstance(module, ResidualBlock):
-                h = module(h, time_emb)
-            elif isinstance(module, CrossAttention):
-                h = module(h, cond_emb)
-            else:
-                # 下採樣層
-                h = module(h)
+        for module in self.input_blocks[1:]:
+            h = module(h) if not isinstance(module[0], ResBlock) else module[0](h, emb)
+            for layer in module[1:]:
+                if isinstance(layer, CrossAttentionBlock) and condition is not None:
+                    h = layer(h, condition)
+                else:
+                    h = layer(h)
             hs.append(h)
         
-        # 中間塊
-        h = self.middle_block1(h, time_emb)
-        h = self.middle_attn(h, cond_emb)
-        h = self.middle_block2(h, time_emb)
+        # 中間部分
+        h = self.middle_block[0](h, emb)
+        for layer in self.middle_block[1:]:
+            if isinstance(layer, CrossAttentionBlock) and condition is not None:
+                h = layer(h, condition)
+            else:
+                h = layer(h)
         
         # 上採樣路徑
-        for module in self.up_blocks:
-            if isinstance(module, ResidualBlock):
-                # 使用跳躍連接
-                h = torch.cat([h, hs.pop()], dim=1)
-                h = module(h, time_emb)
-            elif isinstance(module, CrossAttention):
-                h = module(h, cond_emb)
-            else:
-                # 上採樣層
-                h = module(h)
+        for module in self.output_blocks:
+            # 連接跳躍連接
+            h = torch.cat([h, hs.pop()], dim=1)
+            
+            h = module[0](h, emb)
+            for layer in module[1:]:
+                if isinstance(layer, CrossAttentionBlock) and condition is not None:
+                    h = layer(h, condition)
+                else:
+                    h = layer(h)
         
         # 最終輸出
         return self.out(h)
-
-    def enable_gradient_checkpointing(self):
-        """啟用梯度檢查點以節省顯存"""
-        self.use_checkpoint = True
