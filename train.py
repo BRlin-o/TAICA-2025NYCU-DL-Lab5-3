@@ -79,8 +79,8 @@ def train(config, resume_checkpoint=None):
         unet_sample_size=config.IMAGE_SIZE // 4,  # 潛在空間大小
         condition_embedding_dim=config.CONDITION_DIM,
         device=device,
-        use_pretrain_vae=False, 
-        # use_pretrain_vae=True,
+        # use_pretrain_vae=False, 
+        use_pretrain_vae=True,
     )
     
     # 設置優化器

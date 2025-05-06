@@ -106,31 +106,27 @@ class ConditionalDiffusionModel(nn.Module):
             self.vae = AutoencoderKL(
                 in_channels=3,
                 out_channels=3,
-                # down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-                # up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-                # block_out_channels=(128, 256, 512, 512),
-                down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),  # 減少一層
-                up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),  # 減少一層
-                block_out_channels=(64, 128, 256),  # 降低通道數
+                down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+                up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+                block_out_channels=(128, 256, 512, 512),
+                # down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),  # 減少一層
+                # up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),  # 減少一層
+                # block_out_channels=(64, 128, 256),  # 降低通道數
                 layers_per_block=2,
                 act_fn="silu",
                 latent_channels=unet_in_channels,
                 sample_size=unet_sample_size * 2,
             ).to(device)
-
-            self.vae_scale_factor = 4  # VAE 的縮放因子
+            self.vae_scale_factor = 0.5  # VAE 的縮放因子
+            for param in self.vae.parameters():
+                param.requires_grad = True
         else:
             self.vae_scale_factor = 0.18215  # SD VAE 的縮放因子
-        
-        # 再次確認 VAE 在正確設備上
-        for param in self.vae.parameters():
-            if param.device != device:
-                print(f"警告: VAE 參數在錯誤設備上: {param.device}")
-                param.data = param.data.to(device)
-                
-        # 凍結 VAE 參數
-        for param in self.vae.parameters():
-            param.requires_grad = False
+            for param in self.vae.parameters():
+                if param.device != device:
+                    print(f"警告: VAE 參數在錯誤設備上: {param.device}")
+                    param.data = param.data.to(device)
+                param.requires_grad = False # 預訓練VAE保持凍結
         
         # 設置UNet - 條件式去噪模型的核心
         self.unet = UNet2DConditionModel(
@@ -139,13 +135,14 @@ class ConditionalDiffusionModel(nn.Module):
             out_channels=unet_in_channels,
             layers_per_block=2,
             # block_out_channels=(128, 256, 512, 512),
-            # down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
-            # up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
-            block_out_channels=(64, 128, 256),
-            down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
-            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+            block_out_channels=(64, 128, 256, 512),
+            down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+            # block_out_channels=(64, 128, 256),
+            # down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
+            # up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
             cross_attention_dim=condition_embedding_dim,
-            attention_head_dim=24,  # 增加注意力頭維度
+            attention_head_dim=16,  # 增加注意力頭維度
             dropout=0.1,  # 添加適量的dropout
         ).to(device)
         
@@ -369,44 +366,30 @@ class ConditionalDiffusionModel(nn.Module):
                     # 解碼到圖像空間
                     with torch.no_grad():
                         decoded_images = self.decode(latents)
-                    
-                    # 確保評估器在正確設備上
-                    if hasattr(evaluator, 'resnet18'):
-                        evaluator.resnet18 = evaluator.resnet18.to(self.device)
-                    
-                    # 修正：將圖像設為需要梯度，並在計算梯度的上下文中運行
-                    images = decoded_images.detach().clone()
-                    images.requires_grad_(True)  # 顯式設置 requires_grad=True
-                    
+                        
                     # 標準化用於評估器
-                    norm_images = (images - 0.5) / 0.5  # [0, 1] -> [-1, 1]
+                    norm_images = (decoded_images - 0.5) / 0.5
                     
-                    # 使用評估器計算梯度
-                    logits = evaluator.resnet18(norm_images)
-                    
-                    # 計算分類器損失
-                    cls_loss = -torch.sum(logits * conditions, dim=1).mean()
-                    # cls_loss = -torch.sum(logits * conditions, dim=1).mean() * 2.0
-                    
-                    # 確保損失有梯度，並計算梯度
-                    if cls_loss.requires_grad:
-                        grad = torch.autograd.grad(cls_loss, images, create_graph=False)[0]
+                    # 使用更簡單的引導方法
+                    with torch.enable_grad():
+                        norm_images.requires_grad_(True)
                         
-                        # 縮放梯度並應用到潛在表示
-                        grad_scale = classifier_scale * (1000 - t.item()) / 1000  # 隨著t減小而縮小
-                        # grad_scale = classifier_scale * (1 - i / len(scheduler.timesteps))
+                        # 計算分類器分數
+                        logits = evaluator.resnet18(norm_images)
+                        score = torch.sum(logits * conditions, dim=1).mean()
                         
-                        # 修正潛在向量
-                        with torch.no_grad():
-                            # 獲取編碼梯度
-                            latent_grad = self.encode(images + grad_scale * grad.detach())
-                            latent_orig = self.encode(images)
-                            
-                            # 應用到潛在表示
-                            latents = latents - 0.1 * (latent_grad - latent_orig)
-                            # latents = latents - 0.2 * (latent_grad - latent_orig)
-                    else:
-                        print(f"警告: 分類器損失沒有梯度，跳過分類器引導 (t={t})")
+                        # 計算梯度
+                        grad = torch.autograd.grad(score, norm_images)[0]
+                        
+                        # 應用梯度，但使用小步長
+                        scale = classifier_scale * 0.1 * (1000 - t.item()) / 1000
+                        grad_images = norm_images + scale * grad.sign()  # 使用梯度符號而非精確值
+                        
+                        # 重新編碼回潛在空間
+                        grad_latents = self.encode(grad_images * 0.5 + 0.5)  # 轉回[0,1]範圍
+                        
+                        # 向正確方向調整潛在表示
+                        latents = latents + 0.05 * (grad_latents - latents)
                 except Exception as e:
                     print(f"分類器引導時出錯 (t={t}): {e}")
                     # 繼續執行，忽略此步的分類器引導

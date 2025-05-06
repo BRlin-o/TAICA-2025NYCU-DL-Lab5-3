@@ -33,10 +33,10 @@ class Config:
     # 訓練參數
     BATCH_SIZE = 64  # RTX 3090可以用更大的批次如128
     NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-5
-    FP16 = True  # 使用混合精度訓練
-    GRAD_CLIP = 1.0  # 梯度裁剪
+    LEARNING_RATE = 5e-6
+    WEIGHT_DECAY = 1e-4
+    FP16 = False  # 使用混合精度訓練
+    GRAD_CLIP = 0.5  # 梯度裁剪
     SEED = 42
     
     # 硬體設定
@@ -44,8 +44,8 @@ class Config:
     NUM_WORKERS = 8
     
     # 採樣參數
-    GUIDANCE_SCALE = 4.25  # Classifier-free guidance強度
-    CLASSIFIER_GUIDANCE_SCALE = 0.75  # 分類器引導強度
+    GUIDANCE_SCALE = 3.0  # Classifier-free guidance強度
+    CLASSIFIER_GUIDANCE_SCALE = 0.3  # 分類器引導強度
     
     # 創建必要的目錄
     @staticmethod
