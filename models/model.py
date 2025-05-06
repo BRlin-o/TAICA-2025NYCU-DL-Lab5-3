@@ -251,34 +251,48 @@ class ConditionalDiffusionModel(nn.Module):
             
             # 分類器引導（如果提供了評估器）
             if evaluator is not None and classifier_scale > 0 and t < 500 and t % 5 == 0:
-                with torch.no_grad():
+                try:
                     # 解碼到圖像空間
-                    images = self.decode(latents)
+                    with torch.no_grad():
+                        decoded_images = self.decode(latents)
                     
-                    # 準備評估
-                    norm_images = 2 * images - 1  # [0, 1] -> [-1, 1]
+                    # 確保評估器在正確設備上
+                    if hasattr(evaluator, 'resnet18'):
+                        evaluator.resnet18 = evaluator.resnet18.to(self.device)
+                    
+                    # 修正：將圖像設為需要梯度，並在計算梯度的上下文中運行
+                    images = decoded_images.detach().clone()
+                    images.requires_grad_(True)  # 顯式設置 requires_grad=True
+                    
+                    # 標準化用於評估器
+                    norm_images = (images - 0.5) / 0.5  # [0, 1] -> [-1, 1]
                     
                     # 使用評估器計算梯度
-                    images.requires_grad = True
-                    logits = evaluator.resnet18(images)
+                    logits = evaluator.resnet18(norm_images)
                     
                     # 計算分類器損失
                     cls_loss = -torch.sum(logits * conditions, dim=1).mean()
                     
-                    # 計算梯度
-                    grad = torch.autograd.grad(cls_loss, images)[0]
-                    
-                    # 縮放梯度並應用到潛在表示
-                    grad_scale = classifier_scale * (1000 - t.item()) / 1000  # 隨著t減小而縮小
-                    
-                    # 修正潛在向量
-                    with torch.no_grad():
-                        # 獲取編碼梯度
-                        latent_grad = self.encode(images + grad_scale * grad.detach())
-                        latent_orig = self.encode(images)
+                    # 確保損失有梯度，並計算梯度
+                    if cls_loss.requires_grad:
+                        grad = torch.autograd.grad(cls_loss, images, create_graph=False)[0]
                         
-                        # 應用到潛在表示
-                        latents = latents - 0.1 * (latent_grad - latent_orig)
+                        # 縮放梯度並應用到潛在表示
+                        grad_scale = classifier_scale * (1000 - t.item()) / 1000  # 隨著t減小而縮小
+                        
+                        # 修正潛在向量
+                        with torch.no_grad():
+                            # 獲取編碼梯度
+                            latent_grad = self.encode(images + grad_scale * grad.detach())
+                            latent_orig = self.encode(images)
+                            
+                            # 應用到潛在表示
+                            latents = latents - 0.1 * (latent_grad - latent_orig)
+                    else:
+                        print(f"警告: 分類器損失沒有梯度，跳過分類器引導 (t={t})")
+                except Exception as e:
+                    print(f"分類器引導時出錯 (t={t}): {e}")
+                    # 繼續執行，忽略此步的分類器引導
         
         # 解碼最終的潛在表示為圖像
         with torch.no_grad():

@@ -5,8 +5,20 @@ from config import Config
 from train import train
 from sample import generate_test_images, load_model
 from evaluator import evaluation_model
-from utils.helpers import set_seed
 import logging
+
+def set_seed(seed):
+    """設置所有隨機種子以確保可重現性"""
+    import random
+    import numpy as np
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def main():
     """主程序入口"""
@@ -14,7 +26,9 @@ def main():
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'sample'],
                       help='運行模式: 訓練模型或生成樣本')
     parser.add_argument('--checkpoint', type=str, default=None,
-                      help='用於採樣的特定檢查點路徑')
+                      help='用於採樣或繼續訓練的特定檢查點路徑')
+    parser.add_argument('--resume', action='store_true',
+                      help='從檢查點恢復訓練')
     parser.add_argument('--no_eval', action='store_true',
                       help='採樣時不進行評估')
     parser.add_argument('--batch_size', type=int, default=None,
@@ -43,7 +57,7 @@ def main():
     
     # 創建必要的目錄
     config.create_directories()
-
+    
     # 設置日誌
     logging.basicConfig(
         level=logging.INFO,
@@ -58,14 +72,39 @@ def main():
     # 設置隨機種子
     set_seed(config.SEED)
     
+    # 確定檢查點路徑
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+    elif args.resume:
+        # 如果沒有指定檢查點但要恢復訓練，使用最後一個檢查點或最佳模型
+        checkpoint_dir = config.CHECKPOINT_DIR
+        checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')]
+        
+        if 'model_best.pth' in checkpoint_files:
+            checkpoint_path = os.path.join(checkpoint_dir, 'model_best.pth')
+        elif checkpoint_files:
+            # 按創建時間排序檢查點文件
+            checkpoint_files.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)), reverse=True)
+            checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files[0])
+        else:
+            checkpoint_path = None
+            logger.warning("No checkpoints found, starting from scratch")
+    else:
+        checkpoint_path = None
+    
     if args.mode == 'train':
-        logger.info("開始訓練 Conditional DDPM 模型...")
-        train(config)
+        if args.resume and checkpoint_path:
+            logger.info(f"恢復訓練，從檢查點: {checkpoint_path}")
+            train(config, resume_checkpoint=checkpoint_path)
+        else:
+            logger.info("開始新的訓練...")
+            train(config)
         
     elif args.mode == 'sample':
         logger.info("採樣生成圖像...")
         # 檢查點路徑
-        checkpoint_path = args.checkpoint if args.checkpoint else os.path.join(config.CHECKPOINT_DIR, "model_best.pth")
+        if checkpoint_path is None:
+            checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "model_best.pth")
         
         # 加載評估器（如果需要）
         evaluator = None if args.no_eval else evaluation_model()

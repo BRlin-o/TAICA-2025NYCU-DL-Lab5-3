@@ -35,9 +35,13 @@ def setup_logger(log_dir):
     
     return logging.getLogger("ConditionalDDPM")
 
-def train(config):
+def train(config, resume_checkpoint=None):
     """
     訓練條件式擴散模型
+    
+    Args:
+        config: 配置對象
+        resume_checkpoint: 恢復訓練的檢查點路徑
     """
     logger = setup_logger(config.OUTPUT_DIR)
     logger.info(f"Starting training with config: {vars(config)}")
@@ -90,14 +94,42 @@ def train(config):
         eta_min=1e-5
     )
     
+    # 恢復訓練邏輯
+    start_epoch = 0
+    global_step = 0
+    best_loss = float('inf')
+    
+    if resume_checkpoint is not None and os.path.exists(resume_checkpoint):
+        logger.info(f"Loading checkpoint from {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        
+        # 加載模型參數
+        model.load_state_dict(checkpoint['model'])
+        
+        # 加載優化器狀態
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        
+        # 加載調度器狀態（如果存在）
+        if checkpoint.get('scheduler') is not None:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # 恢復訓練狀態
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('global_step', 0)
+        best_loss = checkpoint.get('loss', float('inf'))
+        
+        logger.info(f"Resuming from epoch {start_epoch}, global step {global_step}, best loss {best_loss:.6f}")
+    else:
+        if resume_checkpoint is not None:
+            logger.warning(f"Checkpoint {resume_checkpoint} not found, starting from scratch")
+        else:
+            logger.info("Starting new training")
+    
     # 使用 Accelerator 準備模型、優化器、資料加載器
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     
     # 訓練循環
-    global_step = 0
-    best_loss = float('inf')
-    
-    for epoch in range(config.NUM_EPOCHS):
+    for epoch in range(start_epoch, config.NUM_EPOCHS):
         model.train()
         epoch_loss = 0
         
@@ -158,12 +190,20 @@ def train(config):
             logger.info(f"Saved checkpoint at epoch {epoch+1}")
             
             # 評估當前模型
-            evaluate(accelerator.unwrap_model(model), evaluator, config, epoch)
+            try:
+                # 使用 try-except 包裝評估過程，防止因評估錯誤中斷訓練
+                evaluate(accelerator.unwrap_model(model), evaluator, config, epoch)
+            except Exception as e:
+                logger.error(f"Error during evaluation: {e}")
+                logger.info("Continuing training despite evaluation error")
     
     logger.info("Training completed!")
     
     # 最終評估
-    evaluate(accelerator.unwrap_model(model), evaluator, config, config.NUM_EPOCHS)
+    try:
+        evaluate(accelerator.unwrap_model(model), evaluator, config, config.NUM_EPOCHS)
+    except Exception as e:
+        logger.error(f"Error during final evaluation: {e}")
 
 def save_sample(model, labels, epoch, step, config):
     """
@@ -178,16 +218,19 @@ def save_sample(model, labels, epoch, step, config):
     # 生成圖片
     sample_model.eval()
     with torch.no_grad():
-        samples = sample_model.sample(
-            labels.to(config.DEVICE),
-            guidance_scale=config.GUIDANCE_SCALE,
-            num_inference_steps=config.NUM_INFERENCE_STEPS // 2,  # 使用更少步數加快採樣
-        )
-        
-        # 保存圖片
-        save_dir = os.path.join(config.OUTPUT_DIR, "samples")
-        os.makedirs(save_dir, exist_ok=True)
-        save_image(samples, os.path.join(save_dir, f"sample_e{epoch+1}_s{step}.png"), nrow=2)
+        try:
+            samples = sample_model.sample(
+                labels.to(config.DEVICE),
+                guidance_scale=config.GUIDANCE_SCALE,
+                num_inference_steps=config.NUM_INFERENCE_STEPS // 2,  # 使用更少步數加快採樣
+            )
+            
+            # 保存圖片
+            save_dir = os.path.join(config.OUTPUT_DIR, "samples")
+            os.makedirs(save_dir, exist_ok=True)
+            save_image(samples, os.path.join(save_dir, f"sample_e{epoch+1}_s{step}.png"), nrow=2)
+        except Exception as e:
+            print(f"Error generating samples: {e}")
     
     sample_model.train()
 
@@ -224,67 +267,93 @@ def evaluate(model, evaluator, config, epoch):
     model.eval()
     
     # 生成測試圖像
-    test_images = model.sample(
-        test_labels.to(config.DEVICE),
-        evaluator=evaluator,
-        guidance_scale=config.GUIDANCE_SCALE,
-        classifier_scale=config.CLASSIFIER_GUIDANCE_SCALE,
-        num_inference_steps=config.NUM_INFERENCE_STEPS,
-    )
-    
-    new_test_images = model.sample(
-        new_test_labels.to(config.DEVICE),
-        evaluator=evaluator,
-        guidance_scale=config.GUIDANCE_SCALE,
-        classifier_scale=config.CLASSIFIER_GUIDANCE_SCALE,
-        num_inference_steps=config.NUM_INFERENCE_STEPS,
-    )
-    
-    # 評估準確率
-    test_norm = (test_images - 0.5) / 0.5  # [0,1] -> [-1,1]
-    new_test_norm = (new_test_images - 0.5) / 0.5
-    
-    with torch.no_grad():
-        test_acc = evaluator.eval(test_norm.to(config.DEVICE), test_labels.to(config.DEVICE))
-        new_test_acc = evaluator.eval(new_test_norm.to(config.DEVICE), new_test_labels.to(config.DEVICE))
-    
-    # 保存評估結果
-    eval_dir = os.path.join(config.OUTPUT_DIR, "eval")
-    os.makedirs(eval_dir, exist_ok=True)
-    
-    # 保存準確率
-    with open(os.path.join(eval_dir, f"accuracy_epoch{epoch}.json"), 'w') as f:
-        json.dump({
-            'test_accuracy': float(test_acc),
-            'new_test_accuracy': float(new_test_acc),
-            'avg_accuracy': float((test_acc + new_test_acc) / 2)
-        }, f, indent=4)
-    
-    # 保存測試圖像
-    test_grid = torch.cat([test_images, new_test_images], dim=0)
-    save_image(test_grid, os.path.join(eval_dir, f"test_samples_epoch{epoch}.png"), nrow=8)
-    
-    # 記錄結果
-    logging.info(f"Evaluation at epoch {epoch}:")
-    logging.info(f"Test Accuracy: {test_acc:.4f}")
-    logging.info(f"New Test Accuracy: {new_test_acc:.4f}")
-    logging.info(f"Avg Accuracy: {(test_acc + new_test_acc) / 2:.4f}")
-    
-    # 如果是最終評估，保存每個樣本
-    if epoch == config.NUM_EPOCHS:
-        # 保存test圖像
-        test_dir = os.path.join(config.IMAGES_DIR, "test")
-        os.makedirs(test_dir, exist_ok=True)
+    try:
+        # 分離評估過程，防止一個評估失敗影響另一個
+        try:
+            test_images = model.sample(
+                test_labels.to(config.DEVICE),
+                evaluator=None,  # 先不使用分類器引導，避免錯誤
+                guidance_scale=config.GUIDANCE_SCALE,
+                classifier_scale=0.0,  # 關閉分類器引導
+                num_inference_steps=config.NUM_INFERENCE_STEPS,
+            )
+        except Exception as e:
+            print(f"Error generating test images: {e}")
+            test_images = None
+            
+        try:
+            new_test_images = model.sample(
+                new_test_labels.to(config.DEVICE),
+                evaluator=None,  # 先不使用分類器引導，避免錯誤
+                guidance_scale=config.GUIDANCE_SCALE,
+                classifier_scale=0.0,  # 關閉分類器引導
+                num_inference_steps=config.NUM_INFERENCE_STEPS,
+            )
+        except Exception as e:
+            print(f"Error generating new test images: {e}")
+            new_test_images = None
         
-        for i in range(test_images.shape[0]):
-            save_image(test_images[i], os.path.join(test_dir, f"{i}.png"))
+        # 評估準確率
+        test_acc = 0.0
+        new_test_acc = 0.0
         
-        # 保存new_test圖像
-        new_test_dir = os.path.join(config.IMAGES_DIR, "new_test")
-        os.makedirs(new_test_dir, exist_ok=True)
+        if test_images is not None:
+            test_norm = (test_images - 0.5) / 0.5  # [0,1] -> [-1,1]
+            with torch.no_grad():
+                test_acc = evaluator.eval(test_norm.to(config.DEVICE), test_labels.to(config.DEVICE))
+                
+        if new_test_images is not None:
+            new_test_norm = (new_test_images - 0.5) / 0.5
+            with torch.no_grad():
+                new_test_acc = evaluator.eval(new_test_norm.to(config.DEVICE), new_test_labels.to(config.DEVICE))
         
-        for i in range(new_test_images.shape[0]):
-            save_image(new_test_images[i], os.path.join(new_test_dir, f"{i}.png"))
+        # 保存評估結果
+        eval_dir = os.path.join(config.OUTPUT_DIR, "eval")
+        os.makedirs(eval_dir, exist_ok=True)
+        
+        # 保存準確率
+        with open(os.path.join(eval_dir, f"accuracy_epoch{epoch}.json"), 'w') as f:
+            json.dump({
+                'test_accuracy': float(test_acc),
+                'new_test_accuracy': float(new_test_acc),
+                'avg_accuracy': float((test_acc + new_test_acc) / 2)
+            }, f, indent=4)
+        
+        # 保存測試圖像
+        if test_images is not None and new_test_images is not None:
+            test_grid = torch.cat([test_images, new_test_images], dim=0)
+            save_image(test_grid, os.path.join(eval_dir, f"test_samples_epoch{epoch}.png"), nrow=8)
+        elif test_images is not None:
+            save_image(test_images, os.path.join(eval_dir, f"test_samples_epoch{epoch}.png"), nrow=8)
+        elif new_test_images is not None:
+            save_image(new_test_images, os.path.join(eval_dir, f"new_test_samples_epoch{epoch}.png"), nrow=8)
+        
+        # 記錄結果
+        logging.info(f"Evaluation at epoch {epoch}:")
+        logging.info(f"Test Accuracy: {test_acc:.4f}")
+        logging.info(f"New Test Accuracy: {new_test_acc:.4f}")
+        logging.info(f"Avg Accuracy: {(test_acc + new_test_acc) / 2:.4f}")
+        
+        # 如果是最終評估，保存每個樣本
+        if epoch == config.NUM_EPOCHS and (test_images is not None or new_test_images is not None):
+            # 保存test圖像
+            if test_images is not None:
+                test_dir = os.path.join(config.IMAGES_DIR, "test")
+                os.makedirs(test_dir, exist_ok=True)
+                
+                for i in range(test_images.shape[0]):
+                    save_image(test_images[i], os.path.join(test_dir, f"{i}.png"))
+            
+            # 保存new_test圖像
+            if new_test_images is not None:
+                new_test_dir = os.path.join(config.IMAGES_DIR, "new_test")
+                os.makedirs(new_test_dir, exist_ok=True)
+                
+                for i in range(new_test_images.shape[0]):
+                    save_image(new_test_images[i], os.path.join(new_test_dir, f"{i}.png"))
+        
+    except Exception as e:
+        logging.error(f"Error during evaluation: {e}")
     
     # 將model重新設置為訓練模式
     model.train()
